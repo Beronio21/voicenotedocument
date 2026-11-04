@@ -10,6 +10,21 @@ type Message =
   | { id: string; role: "user"; content: string; kind: "text" | "audio" }
   | { id: string; role: "assistant"; content: string };
 
+type StoredNote = {
+  id: string;
+  text: string;
+  timestamp: string;
+  is_generated_report: boolean;
+};
+
+type NoteGroup = {
+  key: string;
+  label: string;
+  notes: StoredNote[];
+};
+
+const NOTES_STORAGE_KEY = "voice-note-documents";
+
 function formatDuration(seconds: number) {
   const minutes = Math.floor(seconds / 60).toString().padStart(2, "0");
   const remainder = (seconds % 60).toString().padStart(2, "0");
@@ -87,6 +102,52 @@ function messageId() {
   return `${getCurrentTime()}-${Math.random().toString(36).slice(2)}`;
 }
 
+function dateKey(timestamp: string) {
+  const date = new Date(timestamp);
+  return [
+    date.getFullYear(),
+    String(date.getMonth()).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function formatNoteDate(timestamp: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "long",
+    month: "short",
+    day: "numeric",
+  }).format(new Date(timestamp));
+}
+
+function groupNotes(notes: StoredNote[]) {
+  const groups = new Map<string, NoteGroup>();
+
+  [...notes]
+    .sort(
+      (left, right) =>
+        new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime(),
+    )
+    .forEach((note) => {
+      const key = dateKey(note.timestamp);
+      const group = groups.get(key);
+
+      if (group) {
+        group.notes.push(note);
+        return;
+      }
+
+      groups.set(key, {
+        key,
+        label: formatNoteDate(note.timestamp),
+        notes: [note],
+      });
+    });
+
+  return [...groups.values()].sort((left, right) =>
+    right.key.localeCompare(left.key),
+  );
+}
+
 export default function VoiceRecorder() {
   const [recordingState, setRecordingState] =
     useState<RecordingState>("idle");
@@ -94,11 +155,49 @@ export default function VoiceRecorder() {
   const [textNote, setTextNote] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [storedNotes, setStoredNotes] = useState<StoredNote[]>([]);
+  const [isHydrated, setIsHydrated] = useState(false);
+  const [generatingDate, setGeneratingDate] = useState<string | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const startedAtRef = useRef<number | null>(null);
   const historyRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    try {
+      const savedNotes = window.localStorage.getItem(NOTES_STORAGE_KEY);
+      if (savedNotes) {
+        const parsedNotes = JSON.parse(savedNotes) as unknown;
+        if (Array.isArray(parsedNotes)) {
+          window.setTimeout(() => {
+            if (!cancelled) {
+              setStoredNotes(parsedNotes as StoredNote[]);
+            }
+          }, 0);
+        }
+      }
+    } catch (caughtError) {
+      console.error("Could not load saved notes:", caughtError);
+      window.setTimeout(() => {
+        if (!cancelled) {
+          setError("Saved notes could not be loaded from this browser.");
+        }
+      }, 0);
+    } finally {
+      window.setTimeout(() => {
+        if (!cancelled) {
+          setIsHydrated(true);
+        }
+      }, 0);
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (recordingState !== "recording") {
@@ -129,15 +228,32 @@ export default function VoiceRecorder() {
   }, []);
 
   function addUserMessage(content: string, kind: "text" | "audio") {
+    const note: StoredNote = {
+      id: messageId(),
+      text: content,
+      timestamp: new Date().toISOString(),
+      is_generated_report: false,
+    };
+
     setMessages((current) => [
       ...current,
-      { id: messageId(), role: "user", content, kind },
+      { id: note.id, role: "user", content, kind },
     ]);
+    setStoredNotes((current) => {
+      const next = [...current, note];
+      window.localStorage.setItem(NOTES_STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
   }
 
-  async function structureTranscript(transcript: string) {
+  async function structureTranscript(
+    transcript: string,
+    reportDate: string | null = null,
+    reportTimestamp: string | null = null,
+  ) {
     setRecordingState("structuring");
     const assistantMessageId = messageId();
+    let structuredContent = "";
 
     try {
       const response = await fetch("/api/structure", {
@@ -178,6 +294,7 @@ export default function VoiceRecorder() {
           }
 
           receivedContent = true;
+          structuredContent += chunk;
           setMessages((current) =>
             current.map((message) =>
               message.id === assistantMessageId
@@ -190,6 +307,7 @@ export default function VoiceRecorder() {
         const finalChunk = decoder.decode();
         if (finalChunk) {
           receivedContent = true;
+          structuredContent += finalChunk;
           setMessages((current) =>
             current.map((message) =>
               message.id === assistantMessageId
@@ -205,6 +323,25 @@ export default function VoiceRecorder() {
       if (!receivedContent) {
         throw new Error("Ollama returned an empty structured document.");
       }
+
+      if (reportDate) {
+        const report: StoredNote = {
+          id: assistantMessageId,
+          text: structuredContent,
+          timestamp: reportTimestamp ?? new Date().toISOString(),
+          is_generated_report: true,
+        };
+        setStoredNotes((current) => {
+          const next = [
+            ...current.filter(
+              (note) => !(note.is_generated_report && dateKey(note.timestamp) === reportDate),
+            ),
+            report,
+          ];
+          window.localStorage.setItem(NOTES_STORAGE_KEY, JSON.stringify(next));
+          return next;
+        });
+      }
     } catch (caughtError) {
       setMessages((current) =>
         current.filter((message) => message.id !== assistantMessageId),
@@ -212,11 +349,51 @@ export default function VoiceRecorder() {
       setError(
         caughtError instanceof Error
           ? caughtError.message
-          : "Local AI structuring failed.",
+          : "Document structuring failed.",
       );
     } finally {
       setRecordingState("idle");
+      setGeneratingDate(null);
     }
+  }
+
+  async function generateDailyReport(group: NoteGroup) {
+    if (generatingDate || recordingState !== "idle") {
+      return;
+    }
+
+    const rawNotes = group.notes.filter((note) => !note.is_generated_report);
+    if (rawNotes.length === 0) {
+      return;
+    }
+
+    setError(null);
+    setGeneratingDate(group.key);
+    setMessages((current) => [
+      ...current,
+      ...rawNotes.map((note) => ({
+        id: note.id,
+        role: "user" as const,
+        content: note.text,
+        kind: "text" as const,
+      })),
+    ]);
+    await structureTranscript(
+      rawNotes.map((note) => note.text).join("\n\n"),
+      group.key,
+      rawNotes[0]?.timestamp ?? null,
+    );
+  }
+
+  function deleteDay(group: NoteGroup) {
+    setStoredNotes((current) => {
+      const next = current.filter((note) => dateKey(note.timestamp) !== group.key);
+      window.localStorage.setItem(NOTES_STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+    setMessages((current) =>
+      current.filter((message) => !group.notes.some((note) => note.id === message.id)),
+    );
   }
 
   async function transcribeAudio(blob: Blob) {
@@ -351,6 +528,7 @@ export default function VoiceRecorder() {
   const isRecording = recordingState === "recording";
   const isProcessing =
     recordingState === "transcribing" || recordingState === "structuring";
+  const noteGroups = isHydrated ? groupNotes(storedNotes) : [];
 
   return (
     <main className="flex h-screen flex-col overflow-hidden bg-[#07111f] text-slate-100">
@@ -366,12 +544,79 @@ export default function VoiceRecorder() {
         </span>
       </header>
 
-      <div
-        ref={historyRef}
-        className="flex-1 overflow-y-auto px-4 py-8 sm:px-8"
-        aria-live="polite"
-      >
-        <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col justify-end gap-6">
+      <div className="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-[20rem_minmax(0,1fr)]">
+        <aside className="min-h-48 overflow-y-auto border-b border-white/10 bg-white/[0.03] px-4 py-5 md:min-h-0 md:border-b-0 md:border-r md:px-5">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-white">History</h2>
+            <span className="text-xs text-slate-500">{storedNotes.length} notes</span>
+          </div>
+          {noteGroups.length === 0 ? (
+            <p className="mt-5 text-sm leading-6 text-slate-500">
+              No notes yet
+            </p>
+          ) : (
+            <div className="mt-5 space-y-6">
+              {noteGroups.map((group) => (
+                <section key={group.key} aria-labelledby={`history-${group.key}`}>
+                  <div className="flex items-start justify-between gap-3">
+                    <h3 id={`history-${group.key}`} className="text-xs font-semibold uppercase tracking-[0.12em] text-cyan-200">
+                      {group.label}
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={() => deleteDay(group)}
+                      aria-label={`Delete notes from ${group.label}`}
+                      className="rounded-md px-2 py-1 text-xs text-slate-500 transition hover:bg-rose-300/10 hover:text-rose-200 focus-visible:outline-2 focus-visible:outline-cyan-300"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                  <ol className="mt-3 space-y-2">
+                    {group.notes.map((note) => (
+                      <li key={note.id} className="rounded-xl border border-white/10 bg-white/[0.04] p-3">
+                        <time dateTime={note.timestamp} className="text-[11px] text-slate-500">
+                          {new Intl.DateTimeFormat(undefined, {
+                            hour: "numeric",
+                            minute: "2-digit",
+                          }).format(new Date(note.timestamp))}
+                        </time>
+                        <p className="mt-1 text-sm leading-6 text-slate-300">
+                          {note.is_generated_report ? (
+                            <>
+                              <span className="mb-1 block text-xs font-semibold uppercase tracking-[0.1em] text-violet-200">
+                                Final report
+                              </span>
+                              {note.text}
+                            </>
+                          ) : (
+                            note.text
+                          )}
+                        </p>
+                      </li>
+                    ))}
+                  </ol>
+                  <button
+                    type="button"
+                    onClick={() => void generateDailyReport(group)}
+                    disabled={Boolean(generatingDate) || isProcessing}
+                    className="mt-3 min-h-11 w-full rounded-xl border border-cyan-300/30 px-3 py-2 text-sm font-medium text-cyan-200 transition hover:bg-cyan-300/10 focus-visible:outline-2 focus-visible:outline-cyan-300 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {generatingDate === group.key
+                      ? "Generating report..."
+                      : "Generate Final Report"}
+                  </button>
+                </section>
+              ))}
+            </div>
+          )}
+        </aside>
+
+        <div
+          ref={historyRef}
+          className="flex-1 overflow-y-auto px-4 py-8 sm:px-8"
+          aria-live="polite"
+        >
+          <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col justify-end gap-6">
           {messages.length === 0 ? (
             <div className="my-auto text-center">
               <p className="text-sm font-medium uppercase tracking-[0.22em] text-cyan-300">
@@ -447,6 +692,7 @@ export default function VoiceRecorder() {
           ) : null}
         </div>
       </div>
+      </div>
 
       <form
         onSubmit={submitTextNote}
@@ -464,7 +710,27 @@ export default function VoiceRecorder() {
                 : "border border-white/10 bg-white/[0.08] text-cyan-200 hover:bg-white/[0.14]"
             } disabled:cursor-not-allowed disabled:opacity-50`}
           >
-            {isRecording ? "■" : "●"}
+            {isRecording ? (
+              <span aria-hidden="true" className="text-sm">
+                ■
+              </span>
+            ) : (
+              <svg
+                aria-hidden="true"
+                className="h-5 w-5"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <rect x="9" y="3" width="6" height="11" rx="3" />
+                <path d="M5 11a7 7 0 0 0 14 0" />
+                <path d="M12 18v3" />
+                <path d="M8 21h8" />
+              </svg>
+            )}
           </button>
           <div className="relative flex-1">
             <label htmlFor="text-note" className="sr-only">
